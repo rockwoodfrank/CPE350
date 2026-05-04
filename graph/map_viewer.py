@@ -5,6 +5,12 @@ map_viewer.py
 Continuous live feed with 15-second animated playback.
 Starts immediately with empty map, populates when data arrives.
 Enhanced UI with video playback on incident detection.
+
+Location filter behavior:
+- All vehicles/incidents from ALL locations are always rendered.
+- Selecting a location only changes the map center + zoom (camera focus).
+- "All Locations" zooms out to a California-wide view so every cluster is visible.
+- Animation frames are synced across locations by timestamp.
 """
 
 import os
@@ -38,10 +44,18 @@ if not MAPBOX_TOKEN:
     raise RuntimeError("MAPBOX_ACCESS_TOKEN is missing in .env")
 
 ANCHOR = {"lat": 34.441560, "lon": -119.808362}
+
+# Fixed camera positions — no DB lookup needed, cameras don't move
+CAMERA_COORDS = {
+    "patterson": {"lat": 34.441507, "lon": -119.8084},
+    "foothill":  {"lat": 35.29415,  "lon": -120.66821},
+}
+
 API_BASE_URL = "http://localhost:8000"
 
 MAP_STYLE = "mapbox://styles/mapbox/satellite-streets-v12"
 DEFAULT_ZOOM = 18
+ALL_LOCATIONS_ZOOM = 6   # California-wide view when no specific location is selected
 
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8050"))
@@ -68,43 +82,48 @@ CALTRANS_GREEN = "#007B5F"
 # =========================
 
 def process_window_data(raw_data, location_filter="all"):
+    """
+    Build animation frames from raw window data.
+
+    NOTE: We do NOT filter vehicles/incidents by location here. All locations are
+    always rendered on the map. The `location_filter` value is only stored on the
+    returned dict so the map callback can decide where to center the camera.
+    """
     if not raw_data:
         return None
-    
+
     try:
         vehicles = raw_data.get("vehicles", [])
         incidents = raw_data.get("incidents", [])
         timestamp = raw_data.get("timestamp")
-        
-        if location_filter != "all":
-            vehicles = [v for v in vehicles if v.get("location") == location_filter]
-            incidents = [i for i in incidents if i.get("location") == location_filter]
-        
+
         if not vehicles:
             return None
-        
+
         vehicles_sorted = sorted(vehicles, key=lambda v: v.get("timestamp", ""))
-        
+
+        # Frames are built across ALL locations, keyed by timestamp,
+        # so locations animate in sync.
         frames_dict = defaultdict(lambda: {"vehicles": [], "timestamp_display": None})
-        
+
         for v in vehicles_sorted:
             ts_str = v.get("timestamp")
             if not ts_str:
                 continue
-            
+
             try:
                 ts = pd.to_datetime(ts_str)
                 ts_rounded = ts.floor('10ms')
                 ts_key = ts_rounded.isoformat()
-                
+
                 frames_dict[ts_key]["vehicles"].append(v)
                 if frames_dict[ts_key]["timestamp_display"] is None:
                     frames_dict[ts_key]["timestamp_display"] = ts_rounded.strftime('%H:%M:%S')
-            except:
+            except Exception:
                 continue
-        
+
         sorted_timestamps = sorted(frames_dict.keys())
-        
+
         frames = []
         for ts_key in sorted_timestamps:
             frame_data = frames_dict[ts_key]
@@ -113,16 +132,16 @@ def process_window_data(raw_data, location_filter="all"):
                 "timestamp_display": frame_data["timestamp_display"],
                 "vehicles": frame_data["vehicles"]
             })
-        
+
         return {
             "vehicles": vehicles_sorted,
             "incidents": incidents,
             "timestamp": timestamp,
             "frames": frames,
             "data_id": timestamp,
-            "location_filter": location_filter
+            "location_filter": location_filter,
         }
-    
+
     except Exception as e:
         print(f"Error processing data: {e}")
         import traceback
@@ -130,28 +149,11 @@ def process_window_data(raw_data, location_filter="all"):
         return None
 
 
-def compute_center(vehicles, trim=0.1):
-    pts = [(v.get("lat"), v.get("lon")) for v in vehicles]
-    pts = [(lat, lon) for lat, lon in pts if lat is not None and lon is not None
-           and math.isfinite(lat) and math.isfinite(lon)]
-    if not pts:
-        return dict(ANCHOR)
-
-    lats = sorted(lat for lat, _ in pts)
-    lons = sorted(lon for _, lon in pts)
-    n = len(pts)
-    k = int(n * trim)
-    if n - 2 * k <= 0:
-        k = 0
-
-    lats2 = lats[k:n-k]
-    lons2 = lons[k:n-k]
-    return {"lat": sum(lats2) / len(lats2), "lon": sum(lons2) / len(lons2)}
-
-
-def build_figure(center, frame_vehicles, all_vehicles, incidents, lat_off=0.0, lon_off=0.0):
+def build_figure(center, frame_vehicles, all_vehicles, incidents,
+                 lat_off=0.0, lon_off=0.0, zoom=DEFAULT_ZOOM):
     fig = go.Figure()
-    
+
+    # --- Trajectories (every vehicle from every location) ---
     trajectories = defaultdict(list)
     for v in all_vehicles:
         obj_id = str(v.get("id"))
@@ -162,15 +164,15 @@ def build_figure(center, frame_vehicles, all_vehicles, incidents, lat_off=0.0, l
         ts = v.get("timestamp")
         if lat is not None and lon is not None and ts:
             trajectories[obj_id].append((ts, lat, lon))
-    
+
     for obj_id, points in trajectories.items():
         if len(points) < 2:
             continue
-        
+
         points.sort()
         lats = [p[1] for p in points]
         lons = [p[2] for p in points]
-        
+
         fig.add_trace(go.Scattermapbox(
             lon=lons,
             lat=lats,
@@ -179,10 +181,11 @@ def build_figure(center, frame_vehicles, all_vehicles, incidents, lat_off=0.0, l
             hoverinfo="skip",
             showlegend=False,
         ))
-    
+
+    # --- Current-frame vehicle markers ---
     if frame_vehicles:
         lons, lats, colors, texts, customdata = [], [], [], [], []
-        
+
         for v in frame_vehicles:
             lat, lon = v.get("lat"), v.get("lon")
             if lat is None or lon is None:
@@ -192,31 +195,31 @@ def build_figure(center, frame_vehicles, all_vehicles, incidents, lat_off=0.0, l
 
             if not (math.isfinite(lat) and math.isfinite(lon)):
                 continue
-            
+
             has_incident = len(v.get("incidents", [])) > 0
-            
+
             if has_incident:
                 color = INCIDENT_COLOR
                 typ = f"{v.get('detected_type', 'unknown')} [INCIDENT]"
             else:
                 typ = str(v.get("detected_type", "unknown")).lower()
                 color = COLOR_MAP.get(typ, DEFAULT_COLOR)
-            
+
             lats.append(lat)
             lons.append(lon)
             colors.append(color)
             texts.append(typ)
-            
+
             speed = v.get("speed_mps", 0)
             accel = v.get("accel")
-            
+
             customdata.append([
                 v.get("id"),
                 typ,
                 f"{speed:.1f} m/s",
                 f"{accel:.2f} m/s²" if accel is not None else "N/A"
             ])
-        
+
         fig.add_trace(go.Scattermapbox(
             lon=lons,
             lat=lats,
@@ -231,23 +234,24 @@ def build_figure(center, frame_vehicles, all_vehicles, incidents, lat_off=0.0, l
                 "Accel: %{customdata[3]}<extra></extra>"
             ),
         ))
-    
+
+    # --- Incident markers ---
     if incidents and frame_vehicles:
         inc_lats, inc_lons, inc_texts = [], [], []
-        
+
         for inc in incidents:
             vehicle_ids = inc.get("vehicles", [])
             if not vehicle_ids:
                 continue
-            
+
             first_vehicle = next(
                 (v for v in frame_vehicles if str(v.get("id")) == str(vehicle_ids[0])),
                 None
             )
-            
+
             if not first_vehicle:
                 continue
-            
+
             lat, lon = first_vehicle.get("lat"), first_vehicle.get("lon")
             if lat is None or lon is None:
                 continue
@@ -257,7 +261,7 @@ def build_figure(center, frame_vehicles, all_vehicles, incidents, lat_off=0.0, l
             inc_lats.append(lat)
             inc_lons.append(lon)
             inc_texts.append(f"{inc['incident_type']}<br>Severity: {inc['severity']:.2f}")
-        
+
         if inc_lats:
             fig.add_trace(go.Scattermapbox(
                 lon=inc_lons,
@@ -268,13 +272,13 @@ def build_figure(center, frame_vehicles, all_vehicles, incidents, lat_off=0.0, l
                 hovertext=inc_texts,
                 hoverinfo="text",
             ))
-    
+
     fig.update_layout(
         mapbox=dict(
             accesstoken=MAPBOX_TOKEN,
             style=MAP_STYLE,
             center=dict(lat=center["lat"], lon=center["lon"]),
-            zoom=DEFAULT_ZOOM,
+            zoom=zoom,
             pitch=60,
             bearing=30,
         ),
@@ -282,7 +286,7 @@ def build_figure(center, frame_vehicles, all_vehicles, incidents, lat_off=0.0, l
         showlegend=False,
         uirevision="constant",
     )
-    
+
     return fig
 
 
@@ -507,7 +511,7 @@ def make_theme_toggle(toggle_id="theme-toggle"):
 
 def main():
     print("Starting map viewer (waiting for data)...")
-    
+
     data = {
         "vehicles": [],
         "incidents": [],
@@ -516,17 +520,17 @@ def main():
         "data_id": None,
         "location_filter": "all"
     }
-    
+
     center = ANCHOR
-    fig = build_figure(center, [], [], [])
-    
+    fig = build_figure(center, [], [], [], zoom=ALL_LOCATIONS_ZOOM)
+
     app = Dash(__name__)
     app.title = "Live Traffic Feed"
     app.index_string = INDEX_STRING
-    
+
     app.layout = html.Div([
         make_theme_toggle("theme-toggle"),
-        
+
         # ── Main header — Caltrans style matching dashboard.py ──
         html.Div([
             html.H1("LIVE TRAFFIC FEED", style={
@@ -636,7 +640,7 @@ def main():
             "marginBottom": "20px",
             "boxShadow": "0 3px 10px rgba(0,0,0,0.15)",
         }),
-        
+
         # Stats bar
         html.Div(id="stats-bar", style={
             "fontSize": "14px",
@@ -649,7 +653,7 @@ def main():
             "letterSpacing": "0.3px",
             "fontWeight": "500",
         }),
-        
+
         # Map
         html.Div([
             dcc.Graph(id="map", figure=fig, style={"height": "100%", "width": "100%"}),
@@ -691,7 +695,7 @@ def main():
             "marginBottom": "20px",
             "position": "relative"
         }),
-        
+
         # Controls panel
         html.Div([
             html.Div([
@@ -702,7 +706,7 @@ def main():
                     "color": CALTRANS_BLUE,
                     "letterSpacing": "0.5px",
                 }),
-                
+
                 html.Div([
                     html.Button("Pause", id="pause-btn", n_clicks=0, style={
                         "marginRight": "10px",
@@ -728,18 +732,18 @@ def main():
                         "letterSpacing": "0.5px",
                     }),
                 ], style={"marginBottom": "25px"}),
-                
+
                 html.Div([
                     html.Div([
                         html.Label("Camera Pitch", style={"fontWeight": "600", "marginBottom": "8px", "display": "block", "color": "#555", "fontSize": "13px", "letterSpacing": "0.5px"}),
                         dcc.Slider(0, 85, step=10, value=60, id="pitch-slider", marks={0: "0°", 45: "45°", 85: "85°"}),
                     ], style={"marginBottom": "20px"}),
-                    
+
                     html.Div([
                         html.Label("Camera Bearing", style={"fontWeight": "600", "marginBottom": "8px", "display": "block", "color": "#555", "fontSize": "13px", "letterSpacing": "0.5px"}),
                         dcc.Slider(0, 360, step=15, value=30, id="bearing-slider", marks={0: "N", 90: "E", 180: "S", 270: "W"}),
                     ], style={"marginBottom": "20px"}),
-                    
+
                     html.Div([
                         html.Label("Latitude Offset", style={"fontWeight": "600", "marginBottom": "8px", "display": "block", "color": "#555", "fontSize": "13px", "letterSpacing": "0.5px"}),
                         dcc.Slider(
@@ -749,7 +753,7 @@ def main():
                             tooltip={"placement": "bottom", "always_visible": True}
                         ),
                     ], style={"marginBottom": "20px"}),
-                    
+
                     html.Div([
                         html.Label("Longitude Offset", style={"fontWeight": "600", "marginBottom": "8px", "display": "block", "color": "#555", "fontSize": "13px", "letterSpacing": "0.5px"}),
                         dcc.Slider(
@@ -759,7 +763,7 @@ def main():
                             tooltip={"placement": "bottom", "always_visible": True}
                         ),
                     ], style={"marginBottom": "10px"}),
-                    
+
                     html.Div(id="offset-display", style={"fontSize": "12px", "color": "#777", "letterSpacing": "0.3px"}),
                 ])
             ])
@@ -770,11 +774,12 @@ def main():
             "boxShadow": "0 2px 10px rgba(0,0,0,0.05)",
             "border": "1px solid #e0e0e0"
         }),
-        
+
         dcc.Interval(id="animation-interval", interval=FRAME_INTERVAL_MS, n_intervals=0),
         dcc.Interval(id="reload-interval", interval=1000, n_intervals=0),
-        
+
         dcc.Store(id="data-store", data=data),
+        dcc.Location(id="url", refresh=False),
         dcc.Store(id="current-frame", data=0),
         dcc.Store(id="playing", data=True),
         dcc.Store(id="alert-active", data=False),
@@ -782,6 +787,7 @@ def main():
         dcc.Store(id="current-incident-id", data=None),
         dcc.Store(id="raw-data-store", data=None),
         dcc.Store(id="theme-store", data="light"),
+        dcc.Store(id="location-initialized", data=False),
 
         # Incident modal
         html.Div(
@@ -851,7 +857,7 @@ def main():
                 )
             ],
         ),
-        
+
         html.Div(
             f"Official System Dashboard • {PLAYBACK_FPS} FPS Playback • http://{HOST}:{PORT}",
             style={"marginTop": "20px", "textAlign": "center", "color": "#999", "fontSize": "12px", "letterSpacing": "0.5px"}
@@ -915,7 +921,6 @@ def main():
         Input("theme-toggle", "value"),
     )
 
-
     @app.callback(
         Output("no-data-overlay", "style"),
         Input("data-store", "data"),
@@ -934,7 +939,7 @@ def main():
                 "borderRadius": "4px"
             }
         return {"display": "none"}
-    
+
     @app.callback(
         Output("raw-data-store", "data"),
         Input("reload-interval", "n_intervals"),
@@ -944,23 +949,37 @@ def main():
         if raw_data is None:
             return dash.no_update
         return raw_data
-    
+
     @app.callback(
         Output("location-selector", "options"),
         Output("location-selector", "value"),
+        Output("location-initialized", "data"),
         Input("raw-data-store", "data"),
-        State("location-selector", "value"),
+        State("location-initialized", "data"),
+        State("url", "search"),
     )
-    def populate_location_dropdown(raw_data, current_value):
+    def populate_location_dropdown(raw_data, is_initialized, url_search):
         if not raw_data or not raw_data.get("vehicles"):
-            return [], "all"
-        
+            return [], "all", False
+
         locations = sorted(set(v.get("location") for v in raw_data["vehicles"] if v.get("location")))
         options = [{"label": "All Locations", "value": "all"}]
         options.extend([{"label": loc.title(), "value": loc} for loc in locations])
-        default_value = current_value if current_value else ("all" if len(locations) > 1 else locations[0])
-        return options, default_value
-    
+
+        # Only apply the URL ?location= param on the very first load
+        if not is_initialized:
+            url_loc = None
+            if url_search:
+                from urllib.parse import parse_qs
+                params = parse_qs(url_search.lstrip("?"))
+                url_loc = params.get("location", [None])[0]
+            if url_loc and url_loc in locations:
+                return options, url_loc, True
+            return options, "all", True
+
+        # Already initialized — update options but preserve whatever the user selected
+        return options, dash.no_update, True
+
     @app.callback(
         Output("data-store", "data"),
         Output("current-frame", "data"),
@@ -972,11 +991,14 @@ def main():
         new_data = process_window_data(raw_data, location_filter)
         if new_data is None:
             return dash.no_update, dash.no_update
-        if current_data and new_data["data_id"] == current_data.get("data_id") and new_data["location_filter"] == current_data.get("location_filter"):
+        # Only skip update if BOTH the data id and the selected location match
+        if (current_data
+                and new_data["data_id"] == current_data.get("data_id")
+                and new_data["location_filter"] == current_data.get("location_filter")):
             return dash.no_update, dash.no_update
-        print(f"New data! {len(new_data['frames'])} frames, {len(new_data['vehicles'])} observations (location: {location_filter})")
+        print(f"New data! {len(new_data['frames'])} frames, {len(new_data['vehicles'])} observations (selected: {location_filter})")
         return new_data, 0
-    
+
     @app.callback(
         Output("stats-bar", "children"),
         Input("data-store", "data"),
@@ -984,16 +1006,16 @@ def main():
     def update_stats(data):
         if not data or not data.get("vehicles"):
             return html.Div("Waiting for data...", style={"color": "#999"})
-        
+
         unique_ids = len(set(v.get("id") for v in data["vehicles"]))
         incident_count = len(data.get("incidents", []))
         location = data.get("location_filter", "all")
-        
+
         return html.Div([
             html.Span(data.get('timestamp', 'Unknown'), style={"marginRight": "30px", "fontWeight": "600", "color": CALTRANS_BLUE}),
             html.Span(f"{unique_ids} Vehicles", style={"marginRight": "30px", "fontWeight": "500"}),
             html.Span(f"{len(data.get('frames', []))} Frames", style={"marginRight": "30px", "fontWeight": "500"}),
-            html.Span(f"Location: {location.upper()}", style={"marginRight": "30px", "fontWeight": "500"}),
+            html.Span(f"Viewing: {location.upper()}", style={"marginRight": "30px", "fontWeight": "500"}),
             html.Span(
                 f"{incident_count} Incidents",
                 style={
@@ -1069,7 +1091,7 @@ def main():
 
         first_incident_id = str(incidents[0].get("_id")) if incidents else None
         return modal_style, modal_text, True, False, data_id, first_incident_id
-    
+
     @app.callback(
         Output("video-preview-container", "children"),
         Input("watch-video-btn", "n_clicks"),
@@ -1079,7 +1101,7 @@ def main():
     def show_video_preview(n_clicks, incident_id):
         if not n_clicks or not incident_id:
             raise PreventUpdate
-        
+
         try:
             response = requests.get(f"{API_BASE_URL}/videos/incident/{incident_id}", timeout=10)
             if response.status_code == 200:
@@ -1107,7 +1129,7 @@ def main():
             return html.Div("Could not load video", style={"color": "#c0392b", "marginTop": "15px"})
         except Exception as e:
             return html.Div(f"Error loading video: {str(e)}", style={"color": "#c0392b", "marginTop": "15px"})
-    
+
     @app.callback(
         Output("incident-modal", "style", allow_duplicate=True),
         Output("alert-active", "data", allow_duplicate=True),
@@ -1136,7 +1158,7 @@ def main():
         ts_display = frame.get("timestamp_display", "")
         num_vehicles = len(frame.get("vehicles", []))
         return f"{ts_display} • Frame {frame_idx + 1}/{len(frames)} • {num_vehicles} vehicles"
-    
+
     @app.callback(
         Output("current-frame", "data", allow_duplicate=True),
         Input("animation-interval", "n_intervals"),
@@ -1152,7 +1174,7 @@ def main():
         if current_frame >= len(frames) - 1:
             return dash.no_update
         return current_frame + 1
-    
+
     @app.callback(
         Output("playing", "data"),
         Input("play-btn", "n_clicks"),
@@ -1165,7 +1187,7 @@ def main():
             return True
         button_id = ctx.triggered[0]["prop_id"].split(".")[0]
         return button_id == "play-btn"
-    
+
     @app.callback(
         Output("map", "figure"),
         Input("current-frame", "data"),
@@ -1173,24 +1195,44 @@ def main():
         Input("bearing-slider", "value"),
         Input("lat-offset-slider", "value"),
         Input("lon-offset-slider", "value"),
+        Input("location-selector", "value"),
         State("data-store", "data"),
     )
-    def update_map(frame_idx, pitch, bearing, lat_offset, lon_offset, data):
+    def update_map(frame_idx, pitch, bearing, lat_offset, lon_offset, location_filter, data):
+        # Empty state
         if not data or not data.get("frames"):
-            empty_fig = build_figure(ANCHOR, [], [], [], lat_off=lat_offset, lon_off=lon_offset)
+            empty_fig = build_figure(
+                ANCHOR, [], [], [],
+                lat_off=lat_offset, lon_off=lon_offset, zoom=ALL_LOCATIONS_ZOOM,
+            )
             empty_fig.update_layout(mapbox=dict(pitch=int(pitch), bearing=int(bearing)))
             return empty_fig
-        
+
         frames = data["frames"]
         if frame_idx >= len(frames):
-            return fig
-        
-        frame_vehicles = frames[frame_idx]["vehicles"]
-        center = compute_center(data["vehicles"])
-        new_fig = build_figure(center, frame_vehicles, data["vehicles"], data["incidents"], lat_off=lat_offset, lon_off=lon_offset)
+            frame_idx = len(frames) - 1
+
+        frame_vehicles = frames[frame_idx]["vehicles"]   # all locations, current frame
+        all_vehicles = data["vehicles"]                  # all locations, all frames
+        incidents = data["incidents"]                    # all locations
+
+        # Decide center + zoom based on selected location.
+        # We always render every dot/trajectory — the selection only moves the camera.
+        if location_filter and location_filter != "all":
+            center = CAMERA_COORDS.get(location_filter, ANCHOR)
+            zoom = DEFAULT_ZOOM
+        else:
+            # All Locations: zoom out so every cluster is visible
+            center = ANCHOR
+            zoom = ALL_LOCATIONS_ZOOM
+
+        new_fig = build_figure(
+            center, frame_vehicles, all_vehicles, incidents,
+            lat_off=lat_offset, lon_off=lon_offset, zoom=zoom,
+        )
         new_fig.update_layout(mapbox=dict(pitch=int(pitch), bearing=int(bearing)))
         return new_fig
-    
+
     @app.callback(
         Output("offset-display", "children"),
         Input("lat-offset-slider", "value"),
@@ -1205,7 +1247,7 @@ def main():
     print(f"Open: http://{HOST}:{PORT}")
     print(f"Playing at {PLAYBACK_FPS} FPS (real-time)")
     print("=" * 60 + "\n")
-    
+
     app.run(debug=False, host=HOST, port=PORT, use_reloader=False)
 
 

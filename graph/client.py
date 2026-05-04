@@ -50,7 +50,7 @@ BACKEND_WS_URL = "ws://127.0.0.1:8000/data/stream"
 # SHARED MEMORY (instead of JSON file)
 # =========================
 
-# Store data per location: {"patterson": {...}, "foothill": {...}}
+# FIXED: Store data per location instead of single blob
 SHARED_DATA = {}
 SHARED_DATA_LOCK = Lock()
 
@@ -260,12 +260,14 @@ def main():
         import socket
         hostname = socket.gethostname()
         local_ip = socket.gethostbyname(hostname)
-        print(f"  Map Viewer:      http://127.0.0.1:8050")
+        print(f"  Dashboard:       http://127.0.0.1:8050")
+        print(f"  Map Viewer:      http://127.0.0.1:8053")
         print(f"  Incident Viewer: http://127.0.0.1:8051")
         print(f"  Heatmap Viewer:  http://{local_ip}:8052  <- ACCESS FROM ANY DEVICE")
         print(f"                   http://127.0.0.1:8052  <- LOCAL ACCESS")
     except:
-        print(f"  Map Viewer:      http://127.0.0.1:8050")
+        print(f"  Dashboard:       http://127.0.0.1:8050")
+        print(f"  Map Viewer:      http://127.0.0.1:8053")
         print(f"  Incident Viewer: http://127.0.0.1:8051")
         print(f"  Heatmap Viewer:  http://127.0.0.1:8052")
     print("=" * 70)
