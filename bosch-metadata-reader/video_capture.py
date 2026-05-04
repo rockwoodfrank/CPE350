@@ -32,7 +32,7 @@ camera_name = sys.argv[1]
 camera_info = get_camera_data(camera_name)
 
 VIDEO_DURATION = 15  # seconds per clip
-VIDEO_OUTPUT_DIR = "/Users/dakshesh/CPE 350/bosch-metadata-reader/videos"
+VIDEO_OUTPUT_DIR = "~/Documents/CPE 350/bosch-metadata-reader/videos"
 API_URL = "http://localhost:8000/videos"
 
 # 🧪 TEST MODE - Set to True to keep videos locally (don't delete)
@@ -122,7 +122,7 @@ def capture_video_clip():
     
     # ffmpeg command to capture 15-second clip
     ffmpeg_cmd = [
-        ffmpeg_path,
+        "ffmpeg",
         "-rtsp_transport", "tcp",
         "-i", rtsp_url,
         "-t", str(VIDEO_DURATION),

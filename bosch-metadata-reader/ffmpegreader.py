@@ -207,7 +207,7 @@ else:
         )
 
 ffmpeg_cmd = [
-    FFMPEG_PATH,
+    "ffmpeg",
     "-i", rtsp_url,
     "-map", "0:d",
     "-c", "copy",

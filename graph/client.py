@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / 'visualization'))
 # Import viewers from visualization/
 import map_viewer
 import incident_viewer
-import unified_dashboard
+import heatmap_viewer
 
 # WebSocket imports
 import websockets
@@ -50,21 +50,44 @@ BACKEND_WS_URL = "ws://127.0.0.1:8000/data/stream"
 # SHARED MEMORY (instead of JSON file)
 # =========================
 
-SHARED_DATA = None
+# Store data per location: {"patterson": {...}, "foothill": {...}}
+SHARED_DATA = {}
 SHARED_DATA_LOCK = Lock()
 
 
 def get_latest_data():
-    """Get latest data from shared memory (called by all viewers)."""
+    """Get latest data from shared memory - combines all locations."""
     with SHARED_DATA_LOCK:
-        return SHARED_DATA
+        if not SHARED_DATA:
+            return None
+        
+        # Combine all locations into one payload
+        all_vehicles = []
+        all_incidents = []
+        latest_timestamp = None
+        
+        for location, data in SHARED_DATA.items():
+            if data:
+                all_vehicles.extend(data.get("vehicles", []))
+                all_incidents.extend(data.get("incidents", []))
+                ts = data.get("timestamp")
+                if ts and (latest_timestamp is None or ts > latest_timestamp):
+                    latest_timestamp = ts
+        
+        return {
+            "vehicles": all_vehicles,
+            "incidents": all_incidents,
+            "timestamp": latest_timestamp or "Unknown"
+        }
 
 
 def set_latest_data(data):
-    """Set latest data in shared memory (called by WebSocket)."""
+    """Set latest data in shared memory for a specific location."""
     global SHARED_DATA
     with SHARED_DATA_LOCK:
-        SHARED_DATA = data
+        location = data.get("location", "unknown")
+        SHARED_DATA[location] = data
+        print(f"[Memory] Updated data for location: {location} ({len(data.get('vehicles', []))} vehicles)")
 
 
 # =========================
@@ -165,10 +188,10 @@ def run_incident_viewer():
     incident_viewer.main()
 
 
-def run_unified_dashboard():
+def run_heatmap_viewer():
     """Run heatmap viewer in background thread."""
     print("[START] [Heatmap Viewer] Starting on http://0.0.0.0:8052...")
-    unified_dashboard.main()
+    heatmap_viewer.main()
 
 
 # =========================
@@ -195,7 +218,7 @@ def main():
     dashboard.get_latest_data = get_latest_data
     map_viewer.get_latest_data = get_latest_data
     incident_viewer.get_latest_data = get_latest_data
-    unified_dashboard.get_latest_data = get_latest_data
+    heatmap_viewer.get_latest_data = get_latest_data
     
     # Start WebSocket client in background thread
     print("[START] [WebSocket] Starting background receiver...")
@@ -223,7 +246,7 @@ def main():
     
     # Start heatmap viewer in background thread
     print("[START] [Heatmap Viewer] Starting background heatmap...")
-    heatmap_thread = threading.Thread(target=run_unified_dashboard, daemon=True)
+    heatmap_thread = threading.Thread(target=run_heatmap_viewer, daemon=True)
     heatmap_thread.start()
     
     # Give heatmap viewer a moment to start
