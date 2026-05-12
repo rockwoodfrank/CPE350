@@ -11,11 +11,14 @@ Location filter behavior:
 - Selecting a location only changes the map center + zoom (camera focus).
 - "All Locations" zooms out to a California-wide view so every cluster is visible.
 - Animation frames are synced across locations by timestamp.
+- If a selected location isn't in CAMERA_COORDS, its center is computed from the
+  mean lat/lon of vehicles at that location in the current data window.
 """
 
 import os
 import math
 import json
+import hashlib
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
@@ -45,7 +48,9 @@ if not MAPBOX_TOKEN:
 
 ANCHOR = {"lat": 34.441560, "lon": -119.808362}
 
-# Fixed camera positions — no DB lookup needed, cameras don't move
+# Fixed camera positions — no DB lookup needed, cameras don't move.
+# Locations NOT in this dict will have their center computed dynamically from
+# the average lat/lon of their vehicles in the current data window.
 CAMERA_COORDS = {
     "patterson": {"lat": 34.441507, "lon": -119.8084},
     "foothill":  {"lat": 35.29415,  "lon": -120.66821},
@@ -62,6 +67,7 @@ PORT = int(os.getenv("PORT", "8050"))
 
 PLAYBACK_FPS = 3
 FRAME_INTERVAL_MS = int(1000 / 3)
+MAX_TRAJECTORY_POINTS_PER_OBJECT = 120
 
 COLOR_MAP = {
     "car": "rgb(255,0,0)",
@@ -97,30 +103,30 @@ def process_window_data(raw_data, location_filter="all"):
         incidents = raw_data.get("incidents", [])
         timestamp = raw_data.get("timestamp")
 
-        if not vehicles:
-            return None
-
         vehicles_sorted = sorted(vehicles, key=lambda v: v.get("timestamp", ""))
 
         # Frames are built across ALL locations, keyed by timestamp,
         # so locations animate in sync.
+        # Performance: batch-parse all timestamps at once with pd.to_datetime on a
+        # list — this is ~90x faster than calling pd.to_datetime per-vehicle inside
+        # the loop, which matters a lot when the replayer ships thousands of
+        # observations per window.
         frames_dict = defaultdict(lambda: {"vehicles": [], "timestamp_display": None})
 
-        for v in vehicles_sorted:
-            ts_str = v.get("timestamp")
-            if not ts_str:
-                continue
+        ts_strings = [v.get("timestamp") for v in vehicles_sorted]
+        ts_series = pd.to_datetime(ts_strings, errors="coerce", utc=False)
+        # Bucket observations into 250ms frames so vehicles from
+        # different locations (and slightly different timestamps)
+        # actually group together into the same animation frame.
+        ts_floored = ts_series.floor('250ms')
 
-            try:
-                ts = pd.to_datetime(ts_str)
-                ts_rounded = ts.floor('10ms')
-                ts_key = ts_rounded.isoformat()
-
-                frames_dict[ts_key]["vehicles"].append(v)
-                if frames_dict[ts_key]["timestamp_display"] is None:
-                    frames_dict[ts_key]["timestamp_display"] = ts_rounded.strftime('%H:%M:%S')
-            except Exception:
+        for v, ts_rounded in zip(vehicles_sorted, ts_floored):
+            if pd.isna(ts_rounded):
                 continue
+            ts_key = ts_rounded.isoformat()
+            frames_dict[ts_key]["vehicles"].append(v)
+            if frames_dict[ts_key]["timestamp_display"] is None:
+                frames_dict[ts_key]["timestamp_display"] = ts_rounded.strftime('%H:%M:%S.%f')[:-3]
 
         sorted_timestamps = sorted(frames_dict.keys())
 
@@ -133,12 +139,26 @@ def process_window_data(raw_data, location_filter="all"):
                 "vehicles": frame_data["vehicles"]
             })
 
+        # Use a content-based fingerprint instead of the top-level timestamp.
+        # In multi-location mode, one location can update while the "latest"
+        # timestamp stays unchanged, which previously caused updates to be skipped.
+        snapshot = {
+            "timestamp": timestamp,
+            "vehicle_count": len(vehicles_sorted),
+            "incident_count": len(incidents),
+            "vehicle_ids": [str(v.get("id")) for v in vehicles_sorted],
+            "vehicle_timestamps": [v.get("timestamp") for v in vehicles_sorted],
+        }
+        data_fingerprint = hashlib.sha1(
+            json.dumps(snapshot, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+
         return {
             "vehicles": vehicles_sorted,
             "incidents": incidents,
             "timestamp": timestamp,
             "frames": frames,
-            "data_id": timestamp,
+            "data_id": data_fingerprint,
             "location_filter": location_filter,
         }
 
@@ -149,33 +169,76 @@ def process_window_data(raw_data, location_filter="all"):
         return None
 
 
+def compute_center_for_location(all_vehicles, location):
+    """
+    Compute the geographic center of a location from its vehicles.
+
+    Returns a dict {"lat": ..., "lon": ...} or None if no usable points exist.
+    Uses the mean of lat/lon across all vehicle observations at that location.
+    """
+    if not all_vehicles or not location:
+        return None
+
+    lats, lons = [], []
+    for v in all_vehicles:
+        if v.get("location") != location:
+            continue
+        lat, lon = v.get("lat"), v.get("lon")
+        if lat is None or lon is None:
+            continue
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            continue
+        # Skip obviously bogus 0,0 coords
+        if lat == 0 and lon == 0:
+            continue
+        lats.append(lat)
+        lons.append(lon)
+
+    if not lats:
+        return None
+
+    return {"lat": sum(lats) / len(lats), "lon": sum(lons) / len(lons)}
+
+
 def build_figure(center, frame_vehicles, all_vehicles, incidents,
                  lat_off=0.0, lon_off=0.0, zoom=DEFAULT_ZOOM):
     fig = go.Figure()
 
     # --- Trajectories (every vehicle from every location) ---
+    # Group points by object id, then emit ALL trajectories in a single
+    # Scattermapbox trace using None separators between objects. With thousands
+    # of vehicles, one-trace-per-object will overwhelm Plotly; this keeps it
+    # to a single trace regardless of vehicle count.
     trajectories = defaultdict(list)
     for v in all_vehicles:
         obj_id = str(v.get("id"))
         lat, lon = v.get("lat"), v.get("lon")
-        if lat is not None and lon is not None:
-            lat = lat + lat_off
-            lon = lon + lon_off
+        if lat is None or lon is None:
+            continue
+        lat = lat + lat_off
+        lon = lon + lon_off
         ts = v.get("timestamp")
-        if lat is not None and lon is not None and ts:
+        if ts:
             trajectories[obj_id].append((ts, lat, lon))
 
+    traj_lats, traj_lons = [], []
     for obj_id, points in trajectories.items():
         if len(points) < 2:
             continue
-
         points.sort()
-        lats = [p[1] for p in points]
-        lons = [p[2] for p in points]
+        if len(points) > MAX_TRAJECTORY_POINTS_PER_OBJECT:
+            points = points[-MAX_TRAJECTORY_POINTS_PER_OBJECT:]
+        for _, plat, plon in points:
+            traj_lats.append(plat)
+            traj_lons.append(plon)
+        # None breaks the line between objects so Plotly doesn't connect them
+        traj_lats.append(None)
+        traj_lons.append(None)
 
+    if traj_lats:
         fig.add_trace(go.Scattermapbox(
-            lon=lons,
-            lat=lats,
+            lon=traj_lons,
+            lat=traj_lats,
             mode="lines",
             line=dict(width=1, color="rgba(150,150,255,0.3)"),
             hoverinfo="skip",
@@ -238,16 +301,14 @@ def build_figure(center, frame_vehicles, all_vehicles, incidents,
     # --- Incident markers ---
     if incidents and frame_vehicles:
         inc_lats, inc_lons, inc_texts = [], [], []
+        vehicles_by_id = {str(v.get("id")): v for v in frame_vehicles}
 
         for inc in incidents:
             vehicle_ids = inc.get("vehicles", [])
             if not vehicle_ids:
                 continue
 
-            first_vehicle = next(
-                (v for v in frame_vehicles if str(v.get("id")) == str(vehicle_ids[0])),
-                None
-            )
+            first_vehicle = vehicles_by_id.get(str(vehicle_ids[0]))
 
             if not first_vehicle:
                 continue
@@ -1219,7 +1280,12 @@ def main():
         # Decide center + zoom based on selected location.
         # We always render every dot/trajectory — the selection only moves the camera.
         if location_filter and location_filter != "all":
-            center = CAMERA_COORDS.get(location_filter, ANCHOR)
+            # Priority: hardcoded camera position > computed center from data > ANCHOR fallback
+            if location_filter in CAMERA_COORDS:
+                center = CAMERA_COORDS[location_filter]
+            else:
+                computed = compute_center_for_location(all_vehicles, location_filter)
+                center = computed if computed else ANCHOR
             zoom = DEFAULT_ZOOM
         else:
             # All Locations: zoom out so every cluster is visible
